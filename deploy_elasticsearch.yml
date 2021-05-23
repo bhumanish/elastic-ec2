@@ -1,85 +1,125 @@
 ---
 # ansible-playbook deploy_elasticsearch.yml -vv --private-key=/path/to/ec2/pri/key
 
+---
 - name: Stage instance(s)
-  hosts: local
+  hosts: localhost
   connection: local
   user: root
   gather_facts: false
-  
   tags:
-      - stage
+    - stage
 
-  vars:
-      keypair: EC2KEYPAIRNAME
-      instance_type: t1.micro
-      security_group: EC2SECURITYGROUPNAME
-      image: AMINAME
-      instance_count: 2
+tasks:
+  - name: Launch the new EC2 Instance
+    ec2:
+      instance_type: t2.micro
+      group: manish-SG
+      count: 3
+      key_name: awskeypair
+      image: ami-0fc20dd1da406jkhy
+      region: us-east-2
+      vpc_subnet_id: subnet-0b67481hg7v82fc2d5a
+      wait: yes
+      assign_public_ip: yes
+    register: ec2
 
-  # Launch 2 instances with the following parameters.  Register the output.
+  - name: Add the newly created host so that we can further contact it
+      add_host:
+        name: "{{ item.public_ip }}"
+        groups: deploy
+      with_items: "{{ ec2.instances }}"
 
-  tasks:
-    - name: Launch instance 
-      local_action: ec2 keypair=${keypair} group=${security_group} instance_type=${instance_type} image=${image} wait=yes count=${instance_count}
-      register: ec2
-    
-    # Use with_items to add each instances public IP to a new hostgroup for use in the next play.
 
-    - name: Add new instances to host group
-      local_action: add_host name=${item.public_dns_name} groups=deploy
-      with_items: ${ec2.instances}
+- name: Wait for SSH to come up
+    wait_for:
+      host: "{{ item.public_ip }}"
+      port: 22
+      state: started
+    with_items: "{{ ec2.instances }}"
 
-    # Use the ec2_vol module to create volumes for attachment to each instance. Use with_items to attach to each instance (by returned id) launched previously.
+- name: accept new ssh fingerprints
+    shell: ssh-keyscan -H {{ item.public_ip }} >> ~/.ssh/known_hosts
+    with_items: '{{ ec2.instances }}'
 
-    #- name: Create a volume and attach
-    #  local_action: ec2_vol volume_size=20 instance=${item.id}
-    #  with_items: ${ec2.instances}
+- name: Breathing room (Ansible uses python apt, has issues running directly after boot)
+    pause: seconds=15
 
-    - name: Wait for SSH to be available 
-      local_action: wait_for host=${item.public_dns_name} port=22
-      with_items: ${ec2.instances}
- 
-    - name: Breathing room (Ansible uses python apt, has issues running directly after boot)
-      pause: seconds=15
-
-# This play targets the new host group
-
-- name: Configure instance
+- name: Configuring ElasticSearch
   hosts: deploy
   user: ubuntu
-  sudo: yes
-  gather_facts: true
+  become_method: sudo
+  become: true
+  gather_facts: false
 
-  tags:
-    - config
-    - configure 
+tags:
+  - config
+  - configure
 
-  # Install Java, install Elasticsearch, replace settings....
+tasks:
+  - name: update cache and ignore errors in case of problems
+  become: yes
+  apt: update_cache=yes
+  ignore_errors: yes
 
-  tasks:
+  - name: install nginx
+      become: yes
+      apt:
+        name: nginx
+        purge: yes
+        state: present
 
-    - name: Install JRE
-      apt: pkg=openjdk-6-jre-headless state=latest install_recommends=no update_cache=yes
+  - name: install java 11
+      become: yes
+      apt:
+        name: openjdk-11-jdk
+        purge: yes
+        state: present
 
-    - name: Download ElasticSearch package
-      get_url: url=http://download.elasticsearch.org/elasticsearch/elasticsearch/elasticsearch-0.90.0.deb dest=~/elasticsearch-0.90.0.deb
+  - name: Set Java home
+      shell: sudo echo "JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64" >> /etc/environment
 
-    - name: Install ES .deb file
-      shell: dpkg -i ~/elasticsearch-0.90.0.deb
+      - name: export Java home
+          shell: export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+  - name: Download ElasticSearch package
+      shell: wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -
+
+  - name: check package list
+      shell: echo "deb https://artifacts.elastic.co/packages/7.x/apt stable main" | sudo tee -a /etc/apt/sources.list.d/elastic-7.x.list
+
+  - name: update cache and ignore errors in case of problems
+      become: yes
+      apt: update_cache=yes
+      ignore_errors: yes
+
+  - name: install elasticsearch
+      become: yes
+      apt:
+        name: elasticsearch
+        purge: yes
+        state: present
       notify: restart elasticsearch
 
-    - name: Install cloud-aws plugin
-      shell: /usr/share/elasticsearch/bin/plugin -install elasticsearch/elasticsearch-cloud-aws/1.11.0
-      notify: restart elasticsearch
-
-    - name: Make elasticsearch config dir
-      file: path=/etc/elasticsearch/ state=directory
-
-    - name: Copy over Elasticsearch settings      
+  - name:  over Elasticsearch settings
       copy: src=./elasticsearch/elasticsearch.yml dest=/etc/elasticsearch/elasticsearch.yml
       notify: restart elasticsearch
- 
+
+  - name: Copy over nginx default file
+      copy: src=./elasticsearch/default dest=/etc/nginx/sites-available/default
+      notify: restart nginx
+
+  - name: Copy over chain file
+      copy: src=./elasticsearch/fullchain.pem dest=/etc/nginx/sites-available/fullchain.pem
+      notify: restart nginx
+
+      - name: Copy over pvt keypair
+          copy: src=./elasticsearch/privkey.pem dest=/etc/nginx/sites-available/privkey.pem
+          notify: restart nginx
+
   handlers:
     - name: restart elasticsearch
       action: service name=elasticsearch state=restarted
+
+    - name: restart nginx
+        action: service name=nginx state=restartedCopy
